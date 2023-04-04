@@ -1,4 +1,6 @@
 'use strict';
+const routes = require('./routes.js');
+const auth = require('./auth.js')
 require('dotenv').config();
 const express = require('express');
 const myDB = require('./connection');
@@ -7,15 +9,35 @@ const session = require('express-session')
 const passport = require('passport')
 const { ObjectID } = require('mongodb')
 const LocalStrategy = require('passport-local')
-
+const bcrypt = require('bcrypt')
+const GitHubStrategy = require('passport-github').Strategy
 const app = express();
+const http = require('http').createServer(app)
+const io = require('socket.io')(http)
+const cookieParser = require('cookie-parser')
+const passportSocketIo = require('passport.socketio')
 
-const ensureAuthenticated = (req, res, next) => {
-  if (req.isAuthenticated()) {
-    return next()
-  }
-  res.redirect('/')
+const MongoStore = require('connect-mongo')(session);
+const URI = process.env.MONGO_URI;
+const store = new MongoStore({ url: URI });
+
+
+const clientID = process.env.GITHUB_CLIENT_ID || process.env['GITHUB_CLIENT_ID']
+const clientSecret = process.env.CLIENT_SECRET || process.env['CLIENT_SECRET']
+const callbackURL = 'https://boilerplate-advancednode.delerhon.repl.co/auth/github/callback'
+
+function onAuthorizeSuccess(data, accept) {
+  console.log('successful connection to socket.io');
+
+  accept(null, true);
 }
+
+function onAuthorizeFail(data, message, error, accept) {
+  if (error) throw new Error(message);
+  console.log('failed connection to socket.io:', message);
+  accept(null, false);
+}
+
 
 app.set('view engine', 'pug')
 app.set('views', './views/pug')
@@ -28,7 +50,9 @@ app.use(session( {
   secret: secret,
   resave: true,
   saveUninitialized: true,
-  cookie: {secure: false}
+  cookie: {secure: false},
+  key: 'express.sid',
+  store: store
 }))
 
 app.use(passport.initialize())
@@ -36,105 +60,60 @@ app.use(passport.session())
 
 
 myDB(async client => {
-  const myDataBase = await client.db('test').collection('users_templateExercise')
+  const myDataBase = await client.db('database').collection('users');
 
+  routes(app, myDataBase)
+  auth(app, myDataBase)
+
+}).catch(e => {
   app.route('/').get((req, res) => {
-    res.render('index', {
-      title: 'Connected to Database',
-      message: 'Please login',
-      showLogin: true,
-      showRegistration: true
-    })
+    res.render('index', { title: e, message: 'Unable to connect to database' });
+  });
+});
+
+let currentUsers = 0
+
+io.use(
+  passportSocketIo.authorize({
+    cookieParser: cookieParser,
+    key: 'express.sid',
+    secret: process.env.SESSION_SECRET || process.env['SESSION_SECRET'],
+    store: store,
+    success: onAuthorizeSuccess,
+    fail: onAuthorizeFail
   })
+);
 
-  app.route('/login')
-    .post(passport.authenticate('local', {failureRedirect: '/'}), (req, res) => {
-    res.redirect('/profile')
-  })
-
-  app.route('/profile').get(ensureAuthenticated, (req, res) => {
-    res.render('profile', {username: req.user.username})
-  })
-
-  app.route('/logout').get((req,res) => {
-    req.logout()
-    res.redirect('/')
-  })
-
-  app.use((req, res, next) => {
-    res.status(404)
-      .type('text')
-      .send('Not found')
-  })  
-
-  app.route('/register')
-    .post((req, res, next) => {
-      myDataBase.findOne({ username: req.body.username }, (err, user) => {
-        if (err) {
-          next(err);
-        } else if (user) {
-          res.redirect('/');
-        } else {
-          myDataBase.insertOne({
-            username: req.body.username,
-            password: req.body.password
-          },
-            (err, doc) => {
-              if (err) {
-                res.redirect('/');
-              } else {
-                // The inserted document is held within
-                // the ops property of the doc
-                next(null, doc.ops[0]);
-              }
-            }
-          )
-        }
-      })
-    },
-      passport.authenticate('local', { failureRedirect: '/' }),
-      (req, res, next) => {
-        res.redirect('/profile');
-      }
-    );
-  
-  passport.use(new LocalStrategy((username, password, done) => {
-    myDataBase.findOne({username: username}, (err, user) => {
-      console.log(`User ${username} attempted to Log in.`)
-      if (err) return done(err)
-      if (!user) return done(null, false)
-      if (password !== user.password) return done(null, false)
-      return done(null, user)
-    })
-  }))
-    
-
-  passport.serializeUser((user, done) => {
-    done(null, user._id)
+io.on('connection', socket => {
+  console.log('A user has connected')
+  console.log('user ' + socket.request.user.username + ' connected');
+  ++currentUsers
+  io.emit('user', {
+    username: socket.request.user.username,
+    currentUsers,
+    connected: true
   })
   
-  passport.deserializeUser((id, done) => {
-    myDataBase.findOne({ _id: new ObjectID(id) }, (err, doc) => {
-      done (null, doc)
+  socket.on('chat message', (message) => {
+    io.emit('chat message', {
+      username: socket.request.user.username,
+      message})
+  })
+  
+  socket.on('disconnect', () => {
+    console.log('A user has disconnected');
+    currentUsers--
+      io.emit('user', {
+      username: socket.request.user.username,
+      currentUsers,
+      connected: false
     })
   })
-    
-}).catch(err => {
-  app.route('/').get((req,res) => {
-    res.render('index', {
-      title: err,
-      message: 'Unable to cennect to database'
-    })
-  })
+
+
 })
 
-/* app.route('/').get((req, res) => {
-  res.render('index', { title: 'Hello', message: 'Please log in'})
-}); */
-
-
-
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+http.listen(PORT, () => {
   console.log('Listening on port ' + PORT);
 });
